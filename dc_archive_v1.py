@@ -7,14 +7,16 @@ dc_archive v1 - 디시인사이드 마이너 갤러리 저부하 아카이버
 사용법
   python dc_archive_v1.py crawl                 # 전체 수집 (중단 후 다시 실행하면 이어서 진행)
   python dc_archive_v1.py crawl --update        # 새 글만 추가 수집
+  python dc_archive_v1.py keyword 청음          # 제목+내용에 키워드가 있는 글만 본문+이미지 수집 (이어받기 가능)
   python dc_archive_v1.py stats                 # 수집 현황
   python dc_archive_v1.py search 키워드 [키워드2 ...]
   python dc_archive_v1.py export 키워드 [키워드2 ...] --out result.md
 
 필요 패키지: pip install requests beautifulsoup4
 """
-import argparse, random, re, sqlite3, sys, time
+import argparse, os, random, re, sqlite3, sys, time
 from datetime import datetime
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -23,6 +25,7 @@ from bs4 import BeautifulSoup
 GALL_ID   = "ho1iday"
 BASE      = "https://gall.dcinside.com/mgallery/board"
 DB_PATH   = f"{GALL_ID}.db"
+IMG_DIR   = "images"                 # 키워드 수집 시 이미지 저장 폴더
 
 DELAY_MIN, DELAY_MAX = 4.0, 8.0      # 요청 간 무작위 대기(초)
 LONG_PAUSE_EVERY     = 80            # N회 요청마다
@@ -45,6 +48,10 @@ def db():
         no INTEGER PRIMARY KEY, title TEXT, writer TEXT, date TEXT,
         reply_cnt INTEGER, body TEXT, done INTEGER DEFAULT 0, fetched_at TEXT);
     CREATE TABLE IF NOT EXISTS state(k TEXT PRIMARY KEY, v TEXT);
+    CREATE TABLE IF NOT EXISTS kw_posts(
+        kw TEXT, no INTEGER, done INTEGER DEFAULT 0, PRIMARY KEY(kw, no));
+    CREATE TABLE IF NOT EXISTS images(
+        post_no INTEGER, idx INTEGER, url TEXT, path TEXT, PRIMARY KEY(post_no, idx));
     """)
     return con
 
@@ -74,14 +81,14 @@ class Polite:
         else:
             time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
-    def req(self, method, url, **kw):
+    def req(self, method, url, allow=(), **kw):
         while True:
             self._sleep()
             try:
                 r = self.s.request(method, url, timeout=20, **kw)
             except requests.RequestException as e:
                 r, err = None, str(e)
-            if r is not None and r.status_code == 200:
+            if r is not None and (r.status_code == 200 or r.status_code in allow):
                 self.fail, self.backoff = 0, BACKOFF_START
                 return r
             self.fail += 1
@@ -119,6 +126,37 @@ def parse_view(html):
     soup = BeautifulSoup(html, "html.parser")
     body = soup.select_one("div.write_div")
     return body.get_text("\n", strip=True) if body else ""
+
+def parse_search_nav(html):
+    """검색 결과의 이동 정보: (현재 검색 범위의 마지막 페이지, 다음 검색 범위의 search_pos 또는 None)"""
+    soup = BeautifulSoup(html, "html.parser")
+    last, next_pos = 1, None
+    for a in soup.select("div.bottom_paging_box a[href]"):
+        q = parse_qs(urlparse(a["href"]).query, keep_blank_values=True)
+        if "search_next" in (a.get("class") or []):
+            next_pos = q.get("search_pos", [""])[0] or None
+        elif q.get("page", [""])[0].isdigit():
+            last = max(last, int(q["page"][0]))
+    return last, next_pos
+
+def parse_images(html):
+    """본문(div.write_div) 안의 첨부 이미지 주소 목록과, 건너뛴 img 개수(이모티콘 등)"""
+    body = BeautifulSoup(html, "html.parser").select_one("div.write_div")
+    urls, skipped = [], 0
+    for im in (body.select("img") if body else []):
+        src = im.get("src") or im.get("data-original") or ""
+        if "viewimage.php" in src:
+            urls.append(src)
+        else:
+            skipped += 1
+    return urls, skipped
+
+def img_ext(data):
+    if data[:4] == b"\x89PNG": return ".png"
+    if data[:2] == b"\xff\xd8": return ".jpg"
+    if data[:4] == b"GIF8": return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP": return ".webp"
+    return ".bin"
 
 # ───────────────────────── 수집 ─────────────────────────
 def crawl_lists(con, p, update=False):
@@ -162,6 +200,68 @@ def crawl_bodies(con, p):
         con.commit()
         print(f"  ({i}/{len(todo)}) 글 {no}: 본문 {len(body)}자")
 
+def crawl_keyword_lists(con, p, kw):
+    """갤러리 검색(제목+내용) 결과 목록을 검색 범위(search_pos)를 따라가며 끝까지 수집"""
+    key = f"kw:{kw}"
+    if get_state(con, f"{key}:list_done"):
+        return
+    pos = get_state(con, f"{key}:pos", "")
+    page = int(get_state(con, f"{key}:page", 1))
+    seen = set()
+    while True:
+        r = p.req("GET", f"{BASE}/lists/", params={
+            "id": GALL_ID, "page": page, "search_pos": pos,
+            "s_type": "search_subject_memo", "s_keyword": kw})
+        rows = parse_list(r.text)
+        con.executemany("""INSERT OR IGNORE INTO posts(no,title,writer,date,reply_cnt)
+                           VALUES(?,?,?,?,?)""", rows)
+        con.executemany("INSERT OR IGNORE INTO kw_posts(kw,no) VALUES(?,?)",
+                        [(kw, x[0]) for x in rows])
+        con.commit()
+        last, next_pos = parse_search_nav(r.text)
+        print(f"[검색] 범위 {pos or '최신'} page {page}/{last}: {len(rows)}건")
+        if page < last:
+            page += 1
+        elif next_pos and next_pos != pos and next_pos not in seen:
+            seen.add(pos)
+            pos, page = next_pos, 1
+        else:
+            break
+        set_state(con, f"{key}:pos", pos)
+        set_state(con, f"{key}:page", page)
+    set_state(con, f"{key}:list_done", 1)
+    n = con.execute("SELECT COUNT(*) FROM kw_posts WHERE kw=?", (kw,)).fetchone()[0]
+    print(f"[검색] 목록 완료: '{kw}' 글 {n}건")
+
+def crawl_keyword_posts(con, p, kw):
+    todo = [r[0] for r in con.execute(
+        "SELECT no FROM kw_posts WHERE kw=? AND done=0 ORDER BY no DESC", (kw,))]
+    print(f"[본문+이미지] 남은 글 {len(todo)}건")
+    os.makedirs(IMG_DIR, exist_ok=True)
+    for i, no in enumerate(todo, 1):
+        url = f"{BASE}/view/?id={GALL_ID}&no={no}"
+        r = p.req("GET", url)
+        body = parse_view(r.text)
+        urls, skipped = parse_images(r.text)
+        saved = 0
+        for idx, src in enumerate(urls, 1):
+            ir = p.req("GET", urljoin(url, src), allow=(404, 410),
+                       headers={"Referer": url})
+            if ir.status_code != 200:
+                print(f"    ! 이미지 {idx} 없음({ir.status_code}), 건너뜀")
+                continue
+            path = os.path.join(IMG_DIR, f"{no}_{idx}{img_ext(ir.content)}")
+            with open(path, "wb") as f:
+                f.write(ir.content)
+            con.execute("INSERT OR REPLACE INTO images VALUES(?,?,?,?)", (no, idx, src, path))
+            saved += 1
+        con.execute("UPDATE posts SET body=?, done=1, fetched_at=? WHERE no=?",
+                    (body, datetime.now().isoformat(timespec="seconds"), no))
+        con.execute("UPDATE kw_posts SET done=1 WHERE kw=? AND no=?", (kw, no))
+        con.commit()
+        extra = f", 이모티콘 등 제외 {skipped}" if skipped else ""
+        print(f"  ({i}/{len(todo)}) 글 {no}: 본문 {len(body)}자, 이미지 {saved}/{len(urls)}{extra}")
+
 # ───────────────────────── 검색 / 내보내기 ─────────────────────────
 def search(con, kws):
     cond = " AND ".join(["(title LIKE ? OR body LIKE ?)"] * len(kws))
@@ -176,13 +276,18 @@ def cmd_export(con, kws, out):
         f.write(f"- 갤러리: {GALL_ID} / 추출일: {datetime.now():%Y-%m-%d %H:%M}\n")
         f.write(f"- 일치 글 {len(posts)}건\n\n")
         for no, t, w, d, b in posts:
-            f.write(f"## [{no}] {t}\n작성자: {w} | {d}\n\n{b or ''}\n\n---\n\n")
+            f.write(f"## [{no}] {t}\n작성자: {w} | {d}\n\n{b or ''}\n\n")
+            for (path,) in con.execute(
+                    "SELECT path FROM images WHERE post_no=? ORDER BY idx", (no,)):
+                f.write(f"![이미지]({path.replace(os.sep, '/')})\n")
+            f.write("\n---\n\n")
     print(f"저장 완료: {out}")
 
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("crawl"); c.add_argument("--update", action="store_true")
+    k = sub.add_parser("keyword"); k.add_argument("kw")
     sub.add_parser("stats")
     s = sub.add_parser("search"); s.add_argument("kw", nargs="+")
     e = sub.add_parser("export"); e.add_argument("kw", nargs="+"); e.add_argument("--out", default="result.md")
@@ -194,6 +299,11 @@ def main():
         if a.update or not get_state(con, "list_done"):
             crawl_lists(con, p, update=a.update)
         crawl_bodies(con, p)
+        print("수집 완료")
+    elif a.cmd == "keyword":
+        p = Polite()
+        crawl_keyword_lists(con, p, a.kw)
+        crawl_keyword_posts(con, p, a.kw)
         print("수집 완료")
     elif a.cmd == "stats":
         t, d = con.execute("SELECT COUNT(*), SUM(done) FROM posts").fetchone()
