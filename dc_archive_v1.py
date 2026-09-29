@@ -140,13 +140,22 @@ def parse_search_nav(html):
     return last, next_pos
 
 def parse_images(html):
-    """본문(div.write_div) 안의 첨부 이미지 주소 목록과, 건너뛴 img 개수(이모티콘 등)"""
-    body = BeautifulSoup(html, "html.parser").select_one("div.write_div")
+    """글의 이미지 목록 [(주소, 원본 파일명)]과 건너뛴 img 개수.
+    '원본 첨부파일' 목록(download.php)이 있으면 그것을 쓰고(본문에 안 보이는 것까지 전부 포함),
+    없으면 본문(div.write_div) 안의 viewimage.php 이미지를 쓴다."""
+    soup = BeautifulSoup(html, "html.parser")
+    files = []
+    for a in soup.select("div.appending_file_box ul.appending_file li a[href]"):
+        name = parse_qs(urlparse(a["href"]).query).get("f_no", [""])[0]
+        files.append((a["href"], name or a.get_text(strip=True)))
+    if files:
+        return files, 0
+    body = soup.select_one("div.write_div")
     urls, skipped = [], 0
     for im in (body.select("img") if body else []):
         src = im.get("src") or im.get("data-original") or ""
         if "viewimage.php" in src:
-            urls.append(src)
+            urls.append((src, ""))
         else:
             skipped += 1
     return urls, skipped
@@ -157,6 +166,15 @@ def img_ext(data):
     if data[:4] == b"GIF8": return ".gif"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP": return ".webp"
     return ".bin"
+
+IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
+
+def img_path(no, idx, name, data):
+    stem, ext = os.path.splitext(name)
+    if ext.lower() not in IMG_EXTS:
+        ext = img_ext(data)
+    stem = re.sub(r"[^\w.\-~]", "_", stem)[:60]
+    return os.path.join(IMG_DIR, f"{no}_{idx}_{stem}{ext}" if stem else f"{no}_{idx}{ext}")
 
 # ───────────────────────── 수집 ─────────────────────────
 def crawl_lists(con, p, update=False):
@@ -235,7 +253,7 @@ def crawl_keyword_lists(con, p, kw):
 
 def crawl_keyword_posts(con, p, kw):
     todo = [r[0] for r in con.execute(
-        "SELECT no FROM kw_posts WHERE kw=? AND done=0 ORDER BY no DESC", (kw,))]
+        "SELECT no FROM kw_posts WHERE kw=? AND done<2 ORDER BY no DESC", (kw,))]
     print(f"[본문+이미지] 남은 글 {len(todo)}건")
     os.makedirs(IMG_DIR, exist_ok=True)
     for i, no in enumerate(todo, 1):
@@ -244,20 +262,20 @@ def crawl_keyword_posts(con, p, kw):
         body = parse_view(r.text)
         urls, skipped = parse_images(r.text)
         saved = 0
-        for idx, src in enumerate(urls, 1):
+        for idx, (src, name) in enumerate(urls, 1):
             ir = p.req("GET", urljoin(url, src), allow=(404, 410),
                        headers={"Referer": url})
-            if ir.status_code != 200:
-                print(f"    ! 이미지 {idx} 없음({ir.status_code}), 건너뜀")
+            if ir.status_code != 200 or ir.content[:1] == b"<":     # 없음 / 이미지 아닌 응답(HTML)
+                print(f"    ! 이미지 {idx} 받기 실패({ir.status_code}), 건너뜀: {name or src[:60]}")
                 continue
-            path = os.path.join(IMG_DIR, f"{no}_{idx}{img_ext(ir.content)}")
+            path = img_path(no, idx, name, ir.content)
             with open(path, "wb") as f:
                 f.write(ir.content)
-            con.execute("INSERT OR REPLACE INTO images VALUES(?,?,?,?)", (no, idx, src, path))
+            con.execute("INSERT OR REPLACE INTO images VALUES(?,?,?,?)", (no, idx, urljoin(url, src), path))
             saved += 1
         con.execute("UPDATE posts SET body=?, done=1, fetched_at=? WHERE no=?",
                     (body, datetime.now().isoformat(timespec="seconds"), no))
-        con.execute("UPDATE kw_posts SET done=1 WHERE kw=? AND no=?", (kw, no))
+        con.execute("UPDATE kw_posts SET done=2 WHERE kw=? AND no=?", (kw, no))
         con.commit()
         extra = f", 이모티콘 등 제외 {skipped}" if skipped else ""
         print(f"  ({i}/{len(todo)}) 글 {no}: 본문 {len(body)}자, 이미지 {saved}/{len(urls)}{extra}")
